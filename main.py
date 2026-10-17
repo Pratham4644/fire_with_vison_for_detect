@@ -29,19 +29,19 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffe
 
 # ----------------------------- CONFIG ---------------------------------------
 CAMERAS = {
-    # Use your WEB IPs please
+    "ip_webcam": "http://192.168.1.7:8080/video",
 }
 
 MODEL_PATH = "fire_pretrained.pt"   # pretrained for now; swap to your fine-tuned best.pt later
 IMGSZ = 640                         # model was trained at 640; raise (960/1280) after fine-tuning on GPU
 DEVICE = "cpu"                      # "cpu" on this laptop; 0 for an NVIDIA GPU
-HALF = False                        # FP16 only works on GPU
 
 # Per-class confidence thresholds (class names are read from the model: smoke / fire)
 CLASS_CONF = {"fire": 0.35, "smoke": 0.40}
 
 # CPU budget: analyse each camera at most this many times per second
 INFER_FPS_PER_CAM = 2.0
+SCAN_STATUS_INTERVAL_S = 10.0
 
 # Temporal voting (counted in ANALYSED frames, not camera frames):
 # alarm if >= MIN_HITS of the last WINDOW analysed frames had a detection.
@@ -150,7 +150,7 @@ def draw(frame, dets, cam, alarm):
         cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
         cv2.putText(frame, f"{cls_name} {conf:.2f}", (x1, max(y1 - 6, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
-    label = f"{cam}  ALARM" if alarm else cam
+    label = f"{cam} | FIRE + SMOKE" + (" | ALARM" if alarm else "")
     cv2.rectangle(frame, (0, 0), (frame.shape[1], 28), (0, 0, 180) if alarm else (40, 40, 40), -1)
     cv2.putText(frame, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return frame
@@ -167,19 +167,26 @@ def main():
     model = YOLO(MODEL_PATH)
     names = model.names
     print("model classes:", names)
+    model_classes = names.values() if isinstance(names, dict) else names
+    missing_classes = {"fire", "smoke"} - {str(name).lower() for name in model_classes}
+    if missing_classes:
+        raise RuntimeError(f"Model is missing required classes: {', '.join(sorted(missing_classes))}")
+    print("continuously scanning: fire + smoke")
     min_conf = min(CLASS_CONF.values())
     min_interval = 1.0 / INFER_FPS_PER_CAM
 
     streams = {n: CameraStream(n, u) for n, u in CAMERAS.items()}
     states = {n: CameraState() for n in CAMERAS}
+    latest_detections = {n: set() for n in CAMERAS}
     for s in streams.values():
         s.start()
 
     # Warm-up so the first real frame isn't slow
     model.predict(np.zeros((IMGSZ, IMGSZ, 3), np.uint8), imgsz=IMGSZ, device=DEVICE,
-                  half=HALF, verbose=False)
+                  verbose=False)
 
     fps_t, fps_n, fps = time.time(), 0, 0.0
+    status_t = time.time()
     try:
         while True:
             now = time.time()
@@ -202,11 +209,12 @@ def main():
             else:
                 # 2) One batched inference call for all due cameras
                 results = model.predict(batch_frames, imgsz=IMGSZ, conf=min_conf,
-                                        device=DEVICE, half=HALF, verbose=False)
+                                        device=DEVICE, verbose=False)
 
                 for n, frame, res in zip(batch_names, batch_frames, results):
                     st = states[n]
                     dets = parse_detections(res, names)
+                    latest_detections[n] = {d[0] for d in dets}
 
                     # 3) Temporal voting
                     st.history.append(1 if dets else 0)
@@ -227,6 +235,13 @@ def main():
             if time.time() - fps_t >= 2:
                 fps = fps_n / (time.time() - fps_t)
                 fps_t, fps_n = time.time(), 0
+            if time.time() - status_t >= SCAN_STATUS_INTERVAL_S:
+                camera_status = "; ".join(
+                    f"{n}: {', '.join(sorted(latest_detections[n])) or 'no detections'}"
+                    for n in CAMERAS
+                )
+                print(f"[SCAN] fire + smoke | {fps:.1f} analyzed frames/s | {camera_status}")
+                status_t = time.time()
 
             # 4) Show 2x2 grid
             if SHOW:
